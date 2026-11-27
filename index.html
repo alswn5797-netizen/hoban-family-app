@@ -182,7 +182,7 @@ body.cloud-locked .shell,body.cloud-locked .bottomnav{pointer-events:none;filter
 
 <script>
 (()=>{'use strict';
-const STORE_KEY='hoban-family-movein-v1';const APPID='hoban-movein-family';const BUILD='2026.11.28 · 가계부 개편';
+const STORE_KEY='hoban-family-movein-v1';const APPID='hoban-movein-family';const BUILD='2026.11.28b · 가계부 월별 저장';
 const menu=[['home','🏠','홈'],['search','🔎','통합검색'],['briefing','📰','정보피드'],['money','💰','자금'],['payments','🧾','납부'],['ledger','💳','가계부'],['options','🛠️','옵션견적'],['schedule','🗓️','일정'],['tasks','✅','할 일'],['docs','📁','서류'],['notes','📝','메모'],['settings','⚙️','설정']];
 const seed=()=>({appId:APPID,version:1,updatedAt:new Date().toISOString(),project:{title:'광주 호반써밋 첨단3지구 A8블록',address:'장성군 진원면 학림리 일원',unit:'전용 135㎡ · 약 51평형',moveMonth:'2028-10'},budget:{sale:78700,extension:1415,options:5000,tax:2200,midInterest:3000,other:0,loanRatio:80,alreadyPaid:0,cashAvailable:0},finance:{rate:4.5,years:40,stressRate:5.25,dsr:40,incomeSelf:0,incomeSpouse:0,existingMonthly:0},events:[
 {id:'e-contract',title:'계약금 5% 납부 확인',date:'',month:'',kind:'분양대금',amount:3935,status:'확인필요',owner:'함께',note:'계약 시 1,000만 원 + 계약 후 30일 이내 2,935만 원. 계약서에서 납부 여부·날짜 확인'},
@@ -893,25 +893,6 @@ async function openFamily(){state.mode='loading';state.ready=false;paint();try{
  if(!member.exists){throw Error('가족 공간의 접근 권한이 없습니다. 관리자에게 다시 초대받으세요.');}
  state.role=member.data().role;await activateFamily();
  }catch(e){state.error=firebaseError(e);state.familyId='';state.role='';state.mode='choose';paint()}}
-async function activateFamily(){state.mode='loading';state.ready=false;paint();try{
- const r=docPath(state.familyId).collection('shared').doc('main');const first=await r.get();if(!first.exists)throw Error('공동 데이터가 없습니다.');
- mainRef=r;const d=first.data();lastAppliedRevision=Number(d.revision)||0;
- try{const bk='hoban-backup-before-syncfix-'+state.familyId;if(!localStorage.getItem(bk))localStorage.setItem(bk,JSON.stringify({at:new Date().toISOString(),revision:lastAppliedRevision,server:d.payload,device:getApp().getSnapshot()}));}catch(e){}
- const saved=loadSync();
- if(saved&&saved.pending&&saved.base){
-  const cur=deepClone(getApp().getSnapshot());conflicts=[];
-  const merged=mergeThree(saved.base,cur,deepClone(d.payload));
-  state.base=deepClone(d.payload);getApp()?.applyRemote?.(merged);
-  state.pending=true;state.saveSeq+=1;state.status='저장되지 않았던 변경을 다시 저장합니다';
- }else{state.base=deepClone(d.payload);getApp()?.applyRemote?.(d.payload);state.status='모든 기록 불러옴';}
- persistSync();
- state.ready=true;state.mode='ready';paint();
- state.unsub?.();state.unsub=r.onSnapshot(snapshot=>{
-  if(!snapshot.exists)return;handleRemote(snapshot.data(),false);
- },err=>{state.error='동기화 수신 오류: '+firebaseError(err);paint();});
- if(state.pending){clearTimeout(timer);timer=setTimeout(flush,300);}
- await fetchMembers();
- }catch(e){state.error='가족 데이터 불러오기 실패: '+firebaseError(e);state.ready=false;paint()}}
 async function fetchMembers(){try{const snap=await docPath(state.familyId).collection('members').get();state.members=snap.docs.map(x=>x.data());paint()}catch(e){state.error=firebaseError(e);paint()}}
 function stable(v){if(Array.isArray(v))return '['+v.map(stable).join(',')+']';if(v&&typeof v==='object')return '{'+Object.keys(v).sort().map(k=>JSON.stringify(k)+':'+stable(v[k])).join(',')+'}';return JSON.stringify(v===undefined?null:v)}
 function eq(a,b){return stable(a)===stable(b)}
@@ -959,38 +940,83 @@ function syncKey(){return 'hoban-cloud-sync-'+state.familyId+'-'+uid()}
 function persistSync(){try{if(!state.familyId)return;localStorage.setItem(syncKey(),JSON.stringify({base:state.base,rev:lastAppliedRevision,pending:!!state.pending}))}catch(e){}}
 function loadSync(){try{return JSON.parse(localStorage.getItem(syncKey())||'null')}catch(e){return null}}
 function nowLabel(){const d=new Date();return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')}
-function handleRemote(d,force){
- if(!d||!d.payload||d.payload.appId!==APP)return;
- const rev=Number(d.revision)||0;
- if(rev<=lastAppliedRevision&&!force)return;
+/* 2026-11-28: 가계부는 월별 문서(households/{id}/ledger/{YYYY-MM})에 나눠 저장. 나머지는 shared/main. */
+let remoteMain=null,remoteMonths={},monthRevs={},ledgerCol=null,unsubLedger=null,ledgerLoaded=false,mainLoaded=false;
+function monthOf(x){const m=String(x&&x.date||'').slice(0,7);return /^\d{4}-\d{2}$/.test(m)?m:'nodate'}
+function splitLedger(list){const g={};for(const x of (list||[])){const m=monthOf(x);(g[m]=g[m]||[]).push(x)}return g}
+function composite(main,months){if(!main)return null;const p=deepClone(main);const legacy=Array.isArray(p.ledger)?p.ledger:[];const seen=new Set();const out=[];
+ for(const m of Object.keys(months).sort())for(const x of (months[m]||[])){const k=String(x.id);if(!seen.has(k)){seen.add(k);out.push(x)}}
+ for(const x of legacy){const k=String(x&&x.id);if(!seen.has(k)){seen.add(k);out.push(x)}}
+ p.ledger=out;return p}
+function curRemote(){return composite(remoteMain,remoteMonths)}
+function needsMigration(){return !!(remoteMain&&Array.isArray(remoteMain.ledger)&&remoteMain.ledger.length)}
+function handleRemote(force){
+ if(!mainLoaded||!ledgerLoaded)return;
+ const r=curRemote();if(!r||r.appId!==APP)return;
  if(state.processing){state.missedRemote=true;return;}
+ if(!force&&state.base&&eq(r,state.base))return;
  if(state.pending){
   const cur=deepClone(getApp().getSnapshot());conflicts=[];
-  const merged=mergeThree(state.base?deepClone(state.base):deepClone(d.payload),cur,deepClone(d.payload));
-  state.base=deepClone(d.payload);lastAppliedRevision=Math.max(lastAppliedRevision,rev);
-  getApp()?.applyRemote?.(merged);persistSync();
+  const merged=mergeThree(state.base?deepClone(state.base):deepClone(r),cur,deepClone(r));
+  state.base=deepClone(r);getApp()?.applyRemote?.(merged);persistSync();
   state.status='다른 기기 변경 반영 · 내 변경 저장 대기';paint();
   clearTimeout(timer);timer=setTimeout(flush,state.saveFailed?3000:500);return;
  }
- lastAppliedRevision=Math.max(lastAppliedRevision,rev);state.base=deepClone(d.payload);
- getApp()?.applyRemote?.(d.payload);persistSync();
+ state.base=deepClone(r);getApp()?.applyRemote?.(r);persistSync();
  state.status='다른 기기 변경사항 반영됨 · '+nowLabel();paint();
+ if(needsMigration()){state.pending=true;state.saveSeq+=1;persistSync();clearTimeout(timer);timer=setTimeout(flush,800);}
 }
+async function loadLedgerMonths(){const snap=await ledgerCol.get();const out={},revs={};snap.docs.forEach(d=>{const v=d.data()||{};out[d.id]=Array.isArray(v.items)?v.items:[];revs[d.id]=Number(v.revision)||0});return {out,revs}}
+async function activateFamily(){state.mode='loading';state.ready=false;paint();try{
+ const fam=docPath(state.familyId);const r=fam.collection('shared').doc('main');ledgerCol=fam.collection('ledger');
+ const first=await r.get();if(!first.exists)throw Error('공동 데이터가 없습니다.');
+ mainRef=r;const d=first.data();lastAppliedRevision=Number(d.revision)||0;remoteMain=deepClone(d.payload);mainLoaded=true;
+ const lm=await loadLedgerMonths();remoteMonths=lm.out;monthRevs=lm.revs;ledgerLoaded=true;
+ const server=curRemote();
+ try{const bk='hoban-backup-before-monthsplit-'+state.familyId;if(!localStorage.getItem(bk))localStorage.setItem(bk,JSON.stringify({at:new Date().toISOString(),server,device:getApp().getSnapshot()}));}catch(e){}
+ const saved=loadSync();
+ if(saved&&saved.pending&&saved.base){
+  const cur=deepClone(getApp().getSnapshot());conflicts=[];
+  const merged=mergeThree(saved.base,cur,deepClone(server));
+  state.base=deepClone(server);getApp()?.applyRemote?.(merged);
+  state.pending=true;state.saveSeq+=1;state.status='저장되지 않았던 변경을 다시 저장합니다';
+ }else{state.base=deepClone(server);getApp()?.applyRemote?.(server);state.status='모든 기록 불러옴';}
+ if(needsMigration()){state.pending=true;state.saveSeq+=1;state.status='가계부를 월별 저장으로 옮기는 중';}
+ persistSync();
+ state.ready=true;state.mode='ready';paint();
+ state.unsub?.();state.unsub=r.onSnapshot(snapshot=>{if(!snapshot.exists)return;const v=snapshot.data();if(!v||!v.payload)return;remoteMain=deepClone(v.payload);lastAppliedRevision=Math.max(lastAppliedRevision,Number(v.revision)||0);handleRemote(false);},err=>{state.error='동기화 수신 오류: '+firebaseError(err);paint();});
+ unsubLedger?.();unsubLedger=ledgerCol.onSnapshot(snap=>{const out={},revs={};snap.docs.forEach(x=>{const v=x.data()||{};out[x.id]=Array.isArray(v.items)?v.items:[];revs[x.id]=Number(v.revision)||0});remoteMonths=out;monthRevs=revs;handleRemote(false);},err=>{state.error='가계부 동기화 수신 오류: '+firebaseError(err);paint();});
+ if(state.pending){clearTimeout(timer);timer=setTimeout(flush,300);}
+ await fetchMembers();
+ }catch(e){state.error='가족 데이터 불러오기 실패: '+firebaseError(e);state.ready=false;paint()}}
 function queueSave(){if(!configured||!state.ready||!mainRef)return;
  state.pending=true;state.saveSeq+=1;persistSync();state.status=state.saveFailed?'저장 실패 · 다시 시도 대기':'저장 대기';paint();clearTimeout(timer);timer=setTimeout(flush,state.saveFailed?1500:700);}
 async function flush(){if(!state.ready||!state.pending||state.processing||!mainRef)return;
  if(!navigator.onLine){state.saveFailed=true;state.status='오프라인 · 연결되면 자동 저장';paint();return;}
  state.processing=true;state.missedRemote=false;const seq=state.saveSeq;const local=deepClone(getApp().getSnapshot());const base=state.base?deepClone(state.base):null;state.status='클라우드에 저장 중';paint();
- let ok=false;
+ let ok=false,merged,newMonths;
  try{
-  let merged,rev;
   await db.runTransaction(async tx=>{
    const current=await tx.get(mainRef);if(!current.exists)throw Error('공유 데이터가 없습니다.');
    const v=current.data();if(!v.payload||v.payload.appId!==APP)throw Error('예상한 가족 데이터가 아닙니다.');
-   conflicts=[];merged=mergeThree(base||deepClone(v.payload),local,deepClone(v.payload));rev=(Number(v.revision)||0)+1;
-   tx.set(mainRef,{payload:merged,revision:rev,updatedAt:c().firestore.FieldValue.serverTimestamp(),updatedBy:uid()});
+   const monthIds=new Set([...Object.keys(remoteMonths),...Object.keys(splitLedger(local.ledger)),...Object.keys(splitLedger(base&&base.ledger))]);
+   const months={},docs={};
+   for(const m of monthIds){const ref=ledgerCol.doc(m);const s=await tx.get(ref);docs[m]=s.exists?s.data():null;months[m]=s.exists&&Array.isArray(s.data().items)?s.data().items:[]}
+   const remote=composite(v.payload,months);
+   conflicts=[];merged=mergeThree(base||deepClone(remote),local,deepClone(remote));
+   const groups=splitLedger(merged.ledger);newMonths={};
+   for(const m of new Set([...monthIds,...Object.keys(groups)])){
+    const items=groups[m]||[];newMonths[m]=items;
+    const had=docs[m]?docs[m].items||[]:null;
+    if(had===null&&!items.length)continue;
+    if(had!==null&&eq(had,items))continue;
+    if(items.length>4500)throw Error(`${m} 가계부 거래가 너무 많습니다(${items.length}건). 관리자에게 알려 주세요.`);
+    tx.set(ledgerCol.doc(m),{month:m,items,revision:(Number(docs[m]&&docs[m].revision)||0)+1,updatedAt:c().firestore.FieldValue.serverTimestamp(),updatedBy:uid()});
+   }
+   const mainPayload={...merged,ledger:[]};
+   if(!eq(mainPayload,v.payload)){tx.set(mainRef,{payload:mainPayload,revision:(Number(v.revision)||0)+1,updatedAt:c().firestore.FieldValue.serverTimestamp(),updatedBy:uid()});}
   });
-  ok=true;state.base=deepClone(merged);lastAppliedRevision=Math.max(lastAppliedRevision,rev);
+  ok=true;state.base=deepClone(merged);remoteMain={...deepClone(merged),ledger:[]};remoteMonths=deepClone(newMonths);
   state.saveFailed=false;state.retry=0;state.error='';
   if(state.saveSeq===seq){state.pending=false;getApp()?.applyRemote?.(merged);}
   else{const cur=deepClone(getApp().getSnapshot());const rebased=mergeThree(local,cur,deepClone(merged));getApp()?.applyRemote?.(rebased);state.pending=true;}
@@ -1004,12 +1030,13 @@ async function flush(){if(!state.ready||!state.pending||state.processing||!mainR
  }finally{
   state.processing=false;paint();
   if(ok&&state.pending){clearTimeout(timer);timer=setTimeout(flush,500);}
-  if(ok&&state.missedRemote){state.missedRemote=false;try{const doc=await mainRef.get({source:'server'});if(doc.exists)handleRemote(doc.data(),false);}catch(e){}}
+  if(ok&&state.missedRemote){state.missedRemote=false;try{const d=await mainRef.get({source:'server'});if(d.exists)remoteMain=deepClone(d.data().payload);const lm=await loadLedgerMonths();remoteMonths=lm.out;monthRevs=lm.revs;handleRemote(false);}catch(e){}}
  }}
 async function syncNow(){if(!mainRef)return;state.error='';state.status='동기화 중';paint();try{
  if(state.pending){state.retry=0;await flush();}
- const doc=await mainRef.get({source:'server'});
- if(doc.exists){if(state.pending)handleRemote(doc.data(),true);else{const d=doc.data();lastAppliedRevision=Math.max(lastAppliedRevision,Number(d.revision)||0);state.base=deepClone(d.payload);getApp()?.applyRemote?.(d.payload);persistSync();}}
+ const d=await mainRef.get({source:'server'});if(d.exists)remoteMain=deepClone(d.data().payload);
+ const lm=await loadLedgerMonths();remoteMonths=lm.out;monthRevs=lm.revs;
+ handleRemote(true);
  state.status=state.saveFailed?'저장 실패 · 자동 재시도 중':(state.pending?'저장 대기':'최신 상태 확인 완료 · '+nowLabel());
  }catch(e){state.error='동기화 실패: '+firebaseError(e);state.status='동기화 실패'}paint()}
 document.addEventListener('submit',e=>{if(e.target.id==='cloudAuthForm'){e.preventDefault();authSubmit(e)}if(e.target.id==='familyInviteForm'){e.preventDefault();invite(e)} });
@@ -1020,7 +1047,7 @@ document.addEventListener('click',e=>{const b=e.target.closest('[data-cloud]');i
  }});
 window.addEventListener('online',()=>{if(state.pending)flush()});
 auth.onAuthStateChanged(async user=>{
- state.unsub?.();state.unsub=null;state.user=user;state.ready=false;state.pending=false;state.saveFailed=false;state.retry=0;clearTimeout(timer);state.base=null;state.familyId='';state.role='';state.members=[];state.mode='starting';state.error='';
+ state.unsub?.();state.unsub=null;unsubLedger?.();unsubLedger=null;mainLoaded=false;ledgerLoaded=false;remoteMain=null;remoteMonths={};state.user=user;state.ready=false;state.pending=false;state.saveFailed=false;state.retry=0;clearTimeout(timer);state.base=null;state.familyId='';state.role='';state.members=[];state.mode='starting';state.error='';
  if(!user){state.mode='signedout';paint();return}
  if(!user.emailVerified){state.mode='verify';paint();return}
  await openFamily();
